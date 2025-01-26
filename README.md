@@ -4,8 +4,12 @@
 
 **Features:**
 Upload and process PDF files: Easily upload PDF documents for analysis.
+
 Chunking and Embeddings: Documents are split into chunks, and embeddings are created for efficient search and retrieval.
+
 Similarity-based search: Utilize FAISS for retrieving the most relevant text based on user queries.
+
 Contextual answers: Generate precise answers to user questions using Google Generative AI.
+
 User-friendly interface: Intuitive and straightforward interface built with Streamlit.
 
