@@ -1,74 +1,107 @@
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAI
+import os
 import tempfile
+from PyPDF2 import PdfReader
+from docx import Document
+import subprocess
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from dotenv import load_dotenv
 
-
-API_KEY = "your_google_gemini_api_key_here"  
-
-
-def load_pdf(uploaded_file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        temp_file.write(uploaded_file.read())
-        temp_file_path = temp_file.name
-    loader = PyPDFLoader(temp_file_path)
-    documents = loader.load()
-    return documents
-
-
-def split_text_into_chunks(documents, chunk_size=1000, separator="\n"):
-    from langchain.text_splitter import CharacterTextSplitter
-    text_splitter = CharacterTextSplitter(separator=separator, chunk_size=chunk_size)
-    text_chunks = []
-    for document in documents:
-        text_chunks.extend(text_splitter.split_text(document.page_content))
-    return text_chunks
-
-
-def create_faiss_index(chunks):
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    faiss_db = FAISS.from_texts(texts=chunks, embedding=embeddings)
-    return faiss_db
-
-
-def search_faiss_index(faiss_db, query, k=5):
-    results = faiss_db.similarity_search(query, k=k)
-    return results
-
-
-def generate_answer(api_key, context, query):
-    llm = GoogleGenerativeAI(model="gemini-pro", google_api_key=api_key)
-    prompt = f"Context: {context}\n\nQuestion: {query}\n\nAnswer:"
-    response = llm.invoke(prompt)
-    return response
-
-
-st.set_page_config(page_title="Chat with Doc", layout="wide")
-st.title("Chat with Doc")
-
-
-st.sidebar.header("Upload PDF")
-uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type="pdf")
-
-if uploaded_file:
+def process_documents(uploaded_file):
+    extracted_text = ""
     
-    documents = load_pdf(uploaded_file)
-    st.sidebar.success("PDF loaded successfully!")
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=uploaded_file.name) as temp_file:
+            temp_file.write(uploaded_file.read())
+            temp_path = temp_file.name
 
-    chunks = split_text_into_chunks(documents)
-    faiss_db = create_faiss_index(chunks)
+        if uploaded_file.name.endswith('.pdf'):
+            reader = PdfReader(temp_path)
+            for page in reader.pages:
+                extracted_text += page.extract_text() or ""
+        elif uploaded_file.name.endswith('.docx'):
+            extracted_text = extract_text_from_docx(temp_path)
+        elif uploaded_file.name.endswith('.doc'):
+            extracted_text = extract_text_from_doc(temp_path)
+        else:
+            st.error(f"Unsupported file type: {uploaded_file.name}")
+            return None
+    except Exception as e:
+        st.error(f"Error during text extraction: {e}")
+        return None
+    
+    return extracted_text
+
+def extract_text_from_docx(docx_path):
+    text = ""
+    try:
+        doc = Document(docx_path)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+    except Exception as e:
+        st.error(f"Error extracting text from DOCX: {e}")
+    return text
+
+def extract_text_from_doc(doc_path):
+    try:
+        docx_path = doc_path + ".docx"
+        subprocess.run(["soffice", "--headless", "--convert-to", "docx", doc_path], check=True)
+        return extract_text_from_docx(docx_path)
+    except Exception as e:
+        st.error(f"Error converting DOC to DOCX: {e}")
+        return ""
+
+def get_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return text_splitter.split_text(text)
+
+def get_embeddings(chunks):
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return FAISS.from_texts(texts=chunks, embedding=embeddings)
+
+def rag_pipeline(vectorstore):
+    llm = GoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.3)
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    return ConversationalRetrievalChain.from_llm(llm=llm, retriever=vectorstore.as_retriever(), memory=memory)
+
+def main():
+    load_dotenv()
+    os.environ["GOOGLE_API_KEY"] = "your_gemini_api_key_here"
+    st.set_page_config(page_title="Chat with Doc", layout="wide")
+    st.title("Chat with Your Documents")
+
+    if "conversation" not in st.session_state:
+        st.session_state.conversation = None
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    uploaded_file = st.sidebar.file_uploader("Upload a PDF, DOC, or DOCX file", type=["pdf", "doc", "docx"])
+    if uploaded_file and st.sidebar.button("Process Document"):
+        with st.spinner("Processing document..."):
+            extracted_text = process_documents(uploaded_file)
+            if extracted_text:
+                chunks = get_chunks(extracted_text)
+                vectorstore = get_embeddings(chunks)
+                st.session_state.conversation = rag_pipeline(vectorstore)
+                st.sidebar.success("Document processed successfully!")
 
     st.subheader("Ask Questions about the Document")
-    query = st.text_input("Enter your question here:")
-    if query:
-
-        results = search_faiss_index(faiss_db, query)
-        context = "\n".join([result.page_content for result in results])
-
-        response = generate_answer(API_KEY, context, query)
+    user_question = st.text_input("Enter your question here:")
+    if user_question and st.session_state.conversation:
+        response = st.session_state.conversation({"question": user_question})
+        st.session_state.chat_history.append({"question": user_question, "answer": response["answer"]})
         st.write("### Answer:")
-        st.success(response)
-else:
-    st.info("Please upload a PDF file to get started.")
+        st.success(response["answer"])
+    
+    st.subheader("Query History")
+    for entry in st.session_state.chat_history:
+        st.write(f"**Q:** {entry['question']}")
+        st.write(f"**A:** {entry['answer']}")
+
+if __name__ == "__main__":
+    main()
